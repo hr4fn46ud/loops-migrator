@@ -7,7 +7,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="0.3.3"
+SCRIPT_VERSION="0.3.4"
 DEFAULT_SOURCE="${LOOPS_SOURCE:-https://your.loops.tld}"
 REQUEST_DELAY="${REQUEST_DELAY:-0.5}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
@@ -34,6 +34,7 @@ AUTH_MANUAL=0
 OAUTH_LISTENER_PID=""
 OAUTH_TEMP_DIR=""
 OAUTH_CALLBACK_FILE=""
+OAUTH_LOOPBACK_PORT=""
 
 usage() {
     cat <<'EOF'
@@ -128,77 +129,98 @@ normalise_output_dir() {
     printf '%s' "${output_path%/}"
 }
 
+file_permission_mode() {
+    local target="$1" mode
+    mode=$(stat -f '%Lp' "$target" 2>/dev/null)
+    if [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+        printf '%s' "$mode"
+        return 0
+    fi
+    mode=$(stat -c '%a' "$target" 2>/dev/null)
+    if [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+        printf '%s' "$mode"
+        return 0
+    fi
+    return 1
+}
+
 read_token_file() {
-    local token_path="$1"
+    local token_path="$1" perms group_perm other_perm
     [[ -f "$token_path" ]] || die "Token file not found: ${token_path}"
     API_TOKEN=$(tr -d '\r\n' <"$token_path")
     [[ -n "$API_TOKEN" ]] || die "Token file is empty: ${token_path}"
+    if perms=$(file_permission_mode "$token_path"); then
+        group_perm="${perms: -2:1}"
+        other_perm="${perms: -1:1}"
+        if (( (8#$group_perm & 4) != 0 || (8#$other_perm & 4) != 0 )); then
+            warn "Token file ${token_path} is readable by group or others; consider: chmod 600 ${token_path}"
+        fi
+    fi
 }
 
 oauth_post() {
-    local request_url="$1" request_body="$2" response_file http_code curl_rc
-    response_file=$(mktemp) || die "Could not create a temporary OAuth response file."
-    [[ "$DEBUG" -eq 1 ]] && echo "  -> POST ${request_url}" >&2
-    rdelay
-    curl_rc=0
-    http_code=$(curl -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time "$REQUEST_TIMEOUT" \
-        -o "$response_file" -w '%{http_code}' -X POST \
-        -H 'Accept: application/json' -H 'Content-Type: application/json' \
-        --data-binary @- "$request_url" <<<"$request_body") || curl_rc=$?
-    API_RESPONSE=$(<"$response_file")
-    API_HTTP_CODE="${http_code:-000}"
-    rm -f "$response_file"
-    [[ "$DEBUG" -eq 1 ]] && echo "  <- HTTP ${API_HTTP_CODE}" >&2
-    [[ "$curl_rc" -eq 0 ]] || die "OAuth request failed: POST ${request_url} (curl ${curl_rc})."
+    local request_url="$1" request_body="$2" response_file headers_file http_code curl_rc
+    local attempt=0 retry_delay retry_after
+
+    while true; do
+        response_file=$(mktemp) || die "Could not create a temporary OAuth response file."
+        headers_file=$(mktemp) || { rm -f "$response_file"; die "Could not create a temporary OAuth headers file."; }
+        [[ "$DEBUG" -eq 1 ]] && echo "  -> POST ${request_url}" >&2
+        rdelay
+        curl_rc=0
+        http_code=$(curl -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time "$REQUEST_TIMEOUT" \
+            -D "$headers_file" -o "$response_file" -w '%{http_code}' -X POST \
+            -H 'Accept: application/json' -H 'Content-Type: application/json' \
+            --data-binary @- "$request_url" <<<"$request_body") || curl_rc=$?
+        API_RESPONSE=$(<"$response_file")
+        API_HTTP_CODE="${http_code:-000}"
+        retry_after=$(tr -d '\r' <"$headers_file" | sed -n 's/^[Rr]etry-[Aa]fter:[[:space:]]*//p' | tail -n 1)
+        rm -f "$response_file" "$headers_file"
+        [[ "$DEBUG" -eq 1 ]] && echo "  <- HTTP ${API_HTTP_CODE}" >&2
+
+        if [[ "$curl_rc" -eq 0 && "$API_HTTP_CODE" != 429 && ! "$API_HTTP_CODE" =~ ^5[0-9][0-9]$ ]]; then
+            return 0
+        fi
+        if [[ "$attempt" -ge "$MAX_RETRIES" ]]; then
+            [[ "$curl_rc" -eq 0 ]] && return 0
+            die "OAuth request failed after $((MAX_RETRIES + 1)) attempts: POST ${request_url} (curl ${curl_rc})."
+        fi
+
+        retry_delay=$((RETRY_BASE_DELAY * (2 ** attempt)))
+        if [[ "$API_HTTP_CODE" == 429 && "$retry_after" =~ ^[0-9]+$ ]]; then
+            retry_delay="$retry_after"
+        fi
+        attempt=$((attempt + 1))
+        echo "  OAuth request rate-limited or failed; retrying in ${retry_delay}s (attempt $((attempt + 1))/$((MAX_RETRIES + 1))) ..." >&2
+        sleep "$retry_delay"
+    done
 }
 
 generate_oauth_state() {
     od -An -N24 -tx1 /dev/urandom | tr -d '[:space:]'
 }
 
-choose_loopback_port() {
-    python3 - <<'PY'
-import socket
-
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-    listener.bind(("127.0.0.1", 0))
-    print(listener.getsockname()[1])
-PY
-}
-
-cleanup_oauth_listener() {
-    if [[ -n "$OAUTH_LISTENER_PID" ]] && kill -0 "$OAUTH_LISTENER_PID" >/dev/null 2>&1; then
-        kill "$OAUTH_LISTENER_PID" >/dev/null 2>&1 || true
-        wait "$OAUTH_LISTENER_PID" >/dev/null 2>&1 || true
-    fi
-    OAUTH_LISTENER_PID=""
-    if [[ -n "$OAUTH_TEMP_DIR" && -d "$OAUTH_TEMP_DIR" && \
-        "$(basename "$OAUTH_TEMP_DIR")" == loops-migrator-oauth.* ]]; then
-        rm -rf -- "$OAUTH_TEMP_DIR"
-    fi
-    OAUTH_TEMP_DIR=""
-    OAUTH_CALLBACK_FILE=""
-}
-
 start_oauth_listener() {
-    local port="$1" temp_root
+    local port_file temp_root waited=0
     temp_root="${TMPDIR:-/tmp}"
     OAUTH_TEMP_DIR=$(mktemp -d "${temp_root%/}/loops-migrator-oauth.XXXXXX") || \
         die "Could not create the OAuth callback directory."
     chmod 700 "$OAUTH_TEMP_DIR" || { cleanup_oauth_listener; die "Could not secure the OAuth callback directory."; }
     OAUTH_CALLBACK_FILE="${OAUTH_TEMP_DIR}/callback.json"
+    port_file="${OAUTH_TEMP_DIR}/port"
 
-    python3 - "$port" "$OAUTH_CALLBACK_FILE" <<'PY' &
+    python3 - "$OAUTH_CALLBACK_FILE" "$port_file" <<'PY' &
 import html
 import json
 import os
+import socket
 import sys
 import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
-port = int(sys.argv[1])
-result_path = sys.argv[2]
+result_path = sys.argv[1]
+port_path = sys.argv[2]
 
 
 class CallbackHandler(BaseHTTPRequestHandler):
@@ -246,18 +268,50 @@ class CallbackHandler(BaseHTTPRequestHandler):
         pass
 
 
-server = HTTPServer(("127.0.0.1", port), CallbackHandler)
+# Bind the loopback socket first, then report the chosen port so the
+# redirect URI can never reference a port another process has taken.
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.bind(("127.0.0.1", 0))
+listener.listen(1)
+with open(port_path, "w", encoding="ascii") as port_output:
+    port_output.write(str(listener.getsockname()[1]))
+
+server = HTTPServer(("127.0.0.1", 0), CallbackHandler, bind_and_activate=False)
+server.socket = listener
 server.timeout = 300
 server.handle_request()
 server.server_close()
 PY
     OAUTH_LISTENER_PID=$!
-    sleep 1
-    kill -0 "$OAUTH_LISTENER_PID" >/dev/null 2>&1 || {
-        wait "$OAUTH_LISTENER_PID" >/dev/null 2>&1 || true
+    while [[ ! -s "$port_file" && "$waited" -lt 15 ]]; do
+        if ! kill -0 "$OAUTH_LISTENER_PID" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if [[ ! -s "$port_file" ]]; then
         cleanup_oauth_listener
-        die "Could not start the local OAuth callback on port ${port}. Use --manual-code as a fallback."
-    }
+        die "Could not start the local OAuth callback. Use --manual-code as a fallback."
+    fi
+    OAUTH_LOOPBACK_PORT=$(<"$port_file")
+    [[ "$OAUTH_LOOPBACK_PORT" =~ ^[0-9]+$ ]] || { cleanup_oauth_listener; die "Invalid local OAuth callback port."; }
+    rm -f "$port_file"
+}
+
+cleanup_oauth_listener() {
+    if [[ -n "$OAUTH_LISTENER_PID" ]] && kill -0 "$OAUTH_LISTENER_PID" >/dev/null 2>&1; then
+        kill "$OAUTH_LISTENER_PID" >/dev/null 2>&1 || true
+        wait "$OAUTH_LISTENER_PID" >/dev/null 2>&1 || true
+    fi
+    OAUTH_LISTENER_PID=""
+    if [[ -n "$OAUTH_TEMP_DIR" && -d "$OAUTH_TEMP_DIR" && \
+        "$(basename "$OAUTH_TEMP_DIR")" == loops-migrator-oauth.* ]]; then
+        rm -rf -- "$OAUTH_TEMP_DIR"
+    fi
+    OAUTH_TEMP_DIR=""
+    OAUTH_CALLBACK_FILE=""
+    OAUTH_LOOPBACK_PORT=""
 }
 
 wait_for_oauth_callback() {
@@ -312,7 +366,7 @@ oauth_scopes() {
 }
 
 do_auth() {
-    local source="$1" token_file="$2" client_name="$3" scopes redirect_uri loopback_port=""
+    local source="$1" token_file="$2" client_name="$3" scopes redirect_uri
     local registration_payload client_id client_secret state authorization_url authorization_input
     local authorization_code returned_state token_payload access_token callback_error callback_description
     scopes=$(oauth_scopes)
@@ -321,9 +375,11 @@ do_auth() {
     else
         command -v python3 >/dev/null 2>&1 || \
             die "python3 is required for the automatic OAuth callback. Install it or use --manual-code."
-        loopback_port=$(choose_loopback_port) || die "Could not select a local OAuth callback port."
-        [[ "$loopback_port" =~ ^[0-9]+$ ]] || die "Invalid local OAuth callback port."
-        redirect_uri="http://127.0.0.1:${loopback_port}/callback"
+        # Bind the loopback listener first so the redirect URI references a
+        # port that is already reserved and cannot be taken by another process.
+        start_oauth_listener
+        trap 'cleanup_oauth_listener' EXIT INT TERM
+        redirect_uri="http://127.0.0.1:${OAUTH_LOOPBACK_PORT}/callback"
     fi
 
     [[ -n "$token_file" ]] || die "auth requires --token-file FILE or LOOPS_TOKEN_FILE."
@@ -348,10 +404,6 @@ do_auth() {
     state=$(generate_oauth_state)
     [[ -n "$state" ]] || die "Could not generate OAuth state."
     authorization_url="${source}/oauth/authorize?response_type=code&client_id=$(urlencode "$client_id")&redirect_uri=$(urlencode "$redirect_uri")&scope=$(urlencode "$scopes")&state=$(urlencode "$state")"
-    if [[ "$AUTH_MANUAL" -ne 1 ]]; then
-        start_oauth_listener "$loopback_port"
-        trap 'cleanup_oauth_listener' EXIT INT TERM
-    fi
     echo "  Opening the authorization page in your browser."
     if ! open_authorization_url "$authorization_url"; then
         echo "  Open this URL manually:"

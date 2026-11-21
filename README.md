@@ -6,7 +6,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 This script was initially created for my own purpose and is in no way officially connected to [Loops](https://joinloops.org), the Loops developers or the operators of any instance. Use this script at your own risk!
 
-Version 0.3.3 targets the API behavior of Loops `1.0.0-beta.14`. Export and verification are read-only; import uses the authenticated Studio upload endpoint.
+Version 0.3.4 targets the API behavior of Loops `1.0.0-beta.14`. Export and verification are read-only; import uses the authenticated Studio upload endpoint.
 
 ## Features
 
@@ -53,6 +53,8 @@ The migrator automates client registration, opens the Loops authorization page, 
 Sign in to Loops in the browser and approve access. The browser is redirected to a temporary listener bound exclusively to `127.0.0.1`; it returns the authorization code to the migrator and displays a confirmation page. The listener stops immediately afterward or after a five-minute timeout.
 
 If no supported browser opener is available, the command prints the URL instead; `--no-browser` forces that behavior. The URL must then be opened in a browser on the same computer so it can reach the local callback.
+
+The Loops server rate-limits its OAuth endpoints. If a request is rejected with HTTP 429, the migrator waits as instructed by the server (`Retry-After`) and retries automatically. The 2FA step inside the Loops web UI is limited separately by the server itself (five verification attempts per minute); after repeated failures, let the session rest for a minute and start `auth` again with a fresh code.
 
 The default authorization requests `user:read video:read` and is sufficient for exports. To create a separate token for importing into a target instance, repeat the flow against that instance with video-creation access:
 

@@ -2,6 +2,20 @@
 
 All notable changes to Loops Migrator are documented in this file.
 
+## [0.3.4] - 2026-11-21
+
+### Fixed
+
+- OAuth requests to `/api/v1/apps` and `/oauth/token` now honor HTTP 429 responses: they retry with exponential backoff and respect the `Retry-After` header, matching the rate limits Loops enforces during authentication (including the 2FA verification window).
+- The local OAuth callback listener now binds its `127.0.0.1` port before reporting it, closing the race that could let another process claim the port named in the redirect URI.
+- `read_token_file` warns when the token file is readable by group or others, using a permission probe that works on both BSD/macOS and Linux `stat`.
+
+### Changed
+
+- The regression suite grew to 23 tests: coverage for OAuth rate-limit retries and open token-file permissions was added, and the token-file permission check is now portable across platforms.
+
+[0.3.4]: https://github.com/netherwraith/loops-migrator/releases/tag/v0.3.4
+
 ## [0.3.3] - 2026-09-06
 
 ### Fixed

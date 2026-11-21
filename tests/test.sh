@@ -83,6 +83,21 @@ test_missing_option_value_rejected() {
     [[ $? -ne 0 && "$output" == *'--source requires a non-empty value'* ]]
 }
 
+file_permission_mode() {
+    local target="$1" mode
+    mode=$(stat -f '%Lp' "$target" 2>/dev/null)
+    if [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+        printf '%s' "$mode"
+        return 0
+    fi
+    mode=$(stat -c '%a' "$target" 2>/dev/null)
+    if [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+        printf '%s' "$mode"
+        return 0
+    fi
+    return 1
+}
+
 test_auth_flow_registers_exchanges_and_saves_token() {
     local token_file="$TEST_TMP/auth-token" call_file="$TEST_TMP/oauth-calls"
     local registration_file="$TEST_TMP/registration.json" exchange_file="$TEST_TMP/exchange.json"
@@ -114,7 +129,7 @@ test_auth_flow_registers_exchanges_and_saves_token() {
         }
         do_auth 'https://loops.example' "$token_file" 'Loops Migrator Test' <<<'authorization-code'
     ) 2>&1) || return 1
-    mode=$(stat -f '%Lp' "$token_file" 2>/dev/null || stat -c '%a' "$token_file")
+    mode=$(file_permission_mode "$token_file")
     [[ "$(<"$token_file")" == 'access-token' ]] &&
         [[ "$mode" == 600 ]] &&
         [[ -e "$checked_file" ]] &&
@@ -132,11 +147,11 @@ test_oauth_scopes_match_loops_server() {
 }
 
 test_loopback_oauth_callback_captures_code_and_state() {
-    local port response result
+    local response result
     command -v python3 >/dev/null 2>&1 || return 1
-    port=$(choose_loopback_port) || return 1
-    start_oauth_listener "$port"
-    response=$(curl -sS "http://127.0.0.1:${port}/callback?code=callback-code&state=callback-state") || {
+    start_oauth_listener
+    [[ "$OAUTH_LOOPBACK_PORT" =~ ^[0-9]+$ ]] || { cleanup_oauth_listener; return 1; }
+    response=$(curl -sS "http://127.0.0.1:${OAUTH_LOOPBACK_PORT}/callback?code=callback-code&state=callback-state") || {
         cleanup_oauth_listener
         return 1
     }
@@ -375,6 +390,53 @@ test_upload_timeout_is_not_retried() {
     [[ "$(<"$counter_file")" -eq 1 ]]
 }
 
+test_oauth_post_retries_rate_limit() {
+    # run_test executes this whole function in a subshell, so curl and the
+    # API_* globals can safely be overridden here.
+    local counter_file="$TEST_TMP/oauth-429-count"
+    printf '0\n' >"$counter_file"
+    REQUEST_DELAY=0
+    MAX_RETRIES=2
+    RETRY_BASE_DELAY=0
+    curl() {
+        local count headers_file response_file i
+        headers_file=""
+        response_file=""
+        for ((i = 1; i <= $#; i++)); do
+            [[ "${!i}" == -D ]] && { headers_file="${*:i+1:1}"; continue; }
+            [[ "${!i}" == -o ]] && { response_file="${*:i+1:1}"; continue; }
+        done
+        count=$(<"$counter_file")
+        printf '%s\n' "$((count + 1))" >"$counter_file"
+        if [[ "$count" -eq 0 ]]; then
+            printf 'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\n\r\n' >"$headers_file"
+            printf '{"message":"Too many attempts."}' >"$response_file"
+            printf '429'
+        else
+            : >"$headers_file"
+            printf '{"access_token":"late-token"}' >"$response_file"
+            printf '200'
+        fi
+        return 0
+    }
+    oauth_post 'https://loops.example/oauth/token' '{"grant_type":"authorization_code"}'
+    [[ "$API_HTTP_CODE" == 200 ]] || return 1
+    [[ "$API_RESPONSE" == *'late-token'* ]] || return 1
+    [[ "$(<"$counter_file")" -eq 2 ]]
+}
+
+test_read_token_file_warns_on_open_permissions() {
+    local token_file="$TEST_TMP/open-perm-token" output
+    umask 022
+    printf 'secret-token\n' >"$token_file"
+    chmod 644 "$token_file"
+    output=$(read_token_file "$token_file" 2>&1)
+    [[ "$output" == *'readable by group or others'* ]] &&
+        [[ "$API_TOKEN" == 'secret-token' ]]
+    API_TOKEN=""
+    chmod 600 "$token_file"
+}
+
 run_test 'source URL validation requires HTTPS' test_source_validation
 run_test 'instance-relative media URL is resolved' test_relative_media_url
 run_test 'unsafe media URL scheme is rejected' test_unsafe_media_scheme_rejected
@@ -396,6 +458,8 @@ run_test 'uncertain upload retains duplicate-prevention marker' test_uncertain_u
 run_test 'symlinked backup paths are rejected' test_symlinked_backup_path_is_rejected
 run_test 'upload retries a definite rate limit' test_upload_retries_rate_limit
 run_test 'upload timeout is not blindly retried' test_upload_timeout_is_not_retried
+run_test 'OAuth request retries a definite rate limit' test_oauth_post_retries_rate_limit
+run_test 'token file with open permissions triggers a warning' test_read_token_file_warns_on_open_permissions
 
 echo "${passed} passed, ${failed} failed"
 [[ "$failed" -eq 0 ]]
